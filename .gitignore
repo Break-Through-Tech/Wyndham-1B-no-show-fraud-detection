@@ -1,1 +1,10 @@
+# data files (staying local)
+data/*.csv
+!data/data_dictionary.csv
 
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+venv/
