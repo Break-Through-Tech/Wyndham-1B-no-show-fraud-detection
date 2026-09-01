@@ -1,8 +1,8 @@
 import pandas as pd
 import matplotlib.pyplot as plt
 
-reservations = pd.read_csv("data/reservations_july_2026.csv")
-stays = pd.read_csv("data/stays_july_2026.csv")
+reservations = pd.read_csv("data/reservations_june_2026.csv")
+stays = pd.read_csv("data/stays_june_2026.csv")
 
 print("RESERVATIONS")
 print("Shape:", reservations.shape)
@@ -148,14 +148,14 @@ print("Negative revenue:", (reservations["room_revenue"] < 0).sum())
 
 #for qualification codes
 stays["qualification_code"].value_counts().plot(kind="bar")
-plt.title("July Qualification Code Counts")
+plt.title("June Qualification Code Counts")
 plt.xlabel("Qualification Code")
 plt.ylabel("Number of Records")
 plt.tight_layout()
 plt.show()
 
 reservations["booking_channel"].value_counts().plot(kind="bar")
-plt.title("July Reservations by Booking Channel")
+plt.title("June Reservations by Booking Channel")
 plt.xlabel("Booking Channel")
 plt.ylabel("Number of Reservations")
 plt.xticks(rotation=45)
@@ -166,7 +166,7 @@ stays["points_earned"].plot(
     kind="hist",
     bins=30
 )
-plt.title("July Points Earned Distribution")
+plt.title("June Points Earned Distribution")
 plt.xlabel("Points Earned")
 plt.ylabel("Number of Records")
 plt.tight_layout()
@@ -176,7 +176,7 @@ reservations["room_revenue"].plot(
     kind="hist",
     bins=30
 )
-plt.title("July Room Revenue Distribution")
+plt.title("June Room Revenue Distribution")
 plt.xlabel("Room Revenue")
 plt.ylabel("Number of Reservations")
 plt.tight_layout()
