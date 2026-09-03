@@ -181,3 +181,43 @@ plt.xlabel("Room Revenue")
 plt.ylabel("Number of Reservations")
 plt.tight_layout()
 plt.show()
+
+#checking for qualification code percentage for each member (More QNS and QXY per member is a reg flag)
+status_count = stays.groupby(["member_number", "qualification_code"]).size().unstack(fill_value=0)
+total_stays = status_count.sum(axis=1)
+status_percent = status_count.div(total_stays, axis= 0 ) *100
+print("\nQUALIFICATION CODE PERCENTAGE PER MEMBER")
+print(status_percent.head())
+
+qns_percent = status_percent.sort_values("QNS", ascending = False)
+print("\nTOP 10 MEMBERS BY QNS PERCENTAGE")
+print(qns_percent.head(10))
+
+qxy_percent = status_percent.sort_values("QXY", ascending = False)
+print("\nTOP 10 MEMBERS BY QXY PERCENTAGE")
+print(qxy_percent.head(10))
+
+#revenue check like points/revenue
+paid_stays = stays[stays["room_revenue"]> 0].copy()
+
+paid_stays["points_per_dollar"] = (paid_stays["points_earned"] / paid_stays["room_revenue"])
+
+print("\nPoints earned per dollar of room revenue")
+print(paid_stays["points_per_dollar"].describe())
+
+print("\nMost common points per dollar")
+print(paid_stays["points_per_dollar"].round(2).value_counts().head(10))
+
+#points earned per night
+stays["check_in_date"] = pd.to_datetime(stays["check_in_date"])
+stays["check_out_date"] = pd.to_datetime(stays["check_out_date"])
+stays["nights"] = (stays["check_out_date"] - stays["check_in_date"]).dt.days
+
+valid_stays = stays[stays["nights"] > 0].copy()
+valid_stays["points_per_night"] = valid_stays["points_earned"] /valid_stays["nights"]
+
+print("\nPOINTS EARNED PER NIGHT")
+print(valid_stays["points_per_night"].describe())
+
+print("\nMOST COMMON POINTS PER NIGHT")
+print(valid_stays["points_per_night"].round(2).value_counts().head(10))
