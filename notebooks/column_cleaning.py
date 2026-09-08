@@ -1,56 +1,23 @@
 import pandas as pd
-data = pd.read_parquet("data/combined_may_june_july.parquet")
-print(data.shape)
 
-#im coverting numerical/date cols to datetime
-#Note to self: booking_timestamp has timezone
-date_columns = ["booking_timestamp","check_in_date","check_out_date","cancellation_date","member_enrollment_date"]
-for col in date_columns:
-    data[col] = pd.to_datetime(data[col])
+file_path = "/Users/svalisammagari/Downloads/combined_may_june_july.parquet"
 
-print(data[date_columns].dtypes)
+data = pd.read_parquet(file_path)
 
-#checking for weird checkin and checkouts like (checkingout before chekcing in)
-#and booking after checking in to identify potential bad actors
+pd.set_option("display.max_columns", None)
+pd.set_option("display.width", None)
 
-print("Checkout before check in:", (data["check_out_date"] < data["check_in_date"]).sum())
-print("Booking date after check in date:",(data["booking_timestamp"].dt.date > data["check_in_date"].dt.date).sum())
+print("Original shape:", data.shape)
 
-#checking cacellation dates
-print("Cancel before booking:",(data["cancellation_date"] < data["booking_timestamp"].dt.tz_localize(None)).sum()) #this is outputting 5179
-print("Cancel after check in:",(data["cancellation_date"] > data["check_in_date"]).sum())
+print("\nFIRST 5 RECORDS")
+print(data.head())
 
-cancel_before_booking = data[data["cancellation_date"] < data["booking_timestamp"].dt.tz_localize(None)]
-print("\nCancel before booking check by Qualification code:")
-print(cancel_before_booking["qualification_code"].value_counts())
+import pandas as pd
+import numpy as np
 
-print("\nQNS with cancellation date:", data[(data["qualification_code"] == "QNS")& (data["cancellation_date"].notna())].shape[0])
-
-print("QXY missing cancellation date:",data[(data["qualification_code"] == "QXY") &(data["cancellation_date"].isna())].shape[0])
-
-print("QXN missing cancellation date:",data[(data["qualification_code"] == "QXN") &(data["cancellation_date"].isna())].shape[0])
-
-#checking if cancellation happened before booking
-print("Cancellation date before booking date:",(data["cancellation_date"].dt.date < data["booking_timestamp"].dt.date).sum())
-#okay so noting down out of 5179 records that canceled beforebooking
-#1186 were same day booking/cancellation and were false positives from the timestamp comparison
-#BUT 3993 have a cancellation date that is actually earlier than the booking date (SUS)
-
-print("Member enrollment date after booking date:", (data["member_enrollment_date"].dt.date>data["booking_timestamp"].dt.date).sum())
-#99198 records have enrollment after booking, keeping them since this could be valid
-
-print("\nFinal data check beofre rest of the data cleaning")
-print("Rows:", len(data))
-print("Unique confirmation numbers:", data["confirmation_number"].nunique())
-print("Duplicate confirmation numbers:", data["confirmation_number"].duplicated().sum())
-print("\nRows per month:")
-print(data["month"].value_counts())
-
-#saving cleaned data for the next cleaning step
-data.to_parquet("data/combined_person1_clean.parquet", index=False)
-
-
-
+# --------------------------------------------------
+# BEFORE CLEANING COUNTS
+# --------------------------------------------------
 
 original_row_count = len(data)
 
@@ -138,57 +105,11 @@ else:
     )
 
 
-# SRB rows missing points_redeemed
-srb_missing_points = data[
-    (data["rate_code"] == "SRB")
-    & (data["points_redeemed"].isna())
-]
-
-print("\nSRB ROWS MISSING POINTS_REDEEMED")
-
-if srb_missing_points.empty:
-    print("None found.")
-else:
-    print(
-        srb_missing_points[
-            [
-                "confirmation_number",
-                "rate_code",
-                "points_redeemed",
-                "site_id",
-                "check_in_date"
-            ]
-        ]
-    )
-
-
-# non-SRB rows that have points_redeemed
-non_srb_with_points = data[
-    (data["rate_code"] != "SRB")
-    & (data["points_redeemed"].notna())
-]
-
-print("\nNON-SRB ROWS WITH POINTS_REDEEMED")
-
-if non_srb_with_points.empty:
-    print("None found.")
-else:
-    print(
-        non_srb_with_points[
-            [
-                "confirmation_number",
-                "rate_code",
-                "points_redeemed",
-                "site_id",
-                "check_in_date"
-            ]
-        ]
-    )
 # --------------------------------------------------
 # 4. FILL MISSING POINTS_REDEEMED WITH 0
 # --------------------------------------------------
 
-# data["points_redeemed"] = data["points_redeemed"] * -1
+data["points_redeemed"] = data["points_redeemed"] * -1
 
 missing_points_redeemed_before = data["points_redeemed"].isna().sum()
 
@@ -232,7 +153,7 @@ else:
 numeric_check_columns = [
     "room_revenue",
     "points_earned",
-
+    "points_redeemed"
 ]
 
 for col in numeric_check_columns:
@@ -240,9 +161,10 @@ for col in numeric_check_columns:
     negative_rows = data[data[col] < 0]
 
     print(f"\nNEGATIVE VALUES IN {col.upper()}")
-    print("Number of flagged rows:", len(negative_rows))
 
-    if not negative_rows.empty:
+    if negative_rows.empty:
+        print("None found.")
+    else:
         print(
             negative_rows[
                 [
@@ -252,10 +174,8 @@ for col in numeric_check_columns:
                     "qualification_code",
                     "site_id"
                 ]
-            ].head(10)
+            ]
         )
-
-
 
 
 # --------------------------------------------------
@@ -267,9 +187,10 @@ zero_room_revenue = data[
 ]
 
 print("\nROOM_REVENUE = 0")
-print("Number of flagged rows:", len(zero_room_revenue))
 
-if not zero_room_revenue.empty:
+if zero_room_revenue.empty:
+    print("None found.")
+else:
     print(
         zero_room_revenue[
             [
@@ -281,8 +202,10 @@ if not zero_room_revenue.empty:
                 "check_in_date",
                 "check_out_date"
             ]
-        ].head(10)
+        ]
     )
+
+
 # --------------------------------------------------
 # 8. FLAG HIGH OUTLIERS USING IQR
 # --------------------------------------------------
@@ -293,6 +216,7 @@ for col in numeric_check_columns:
     q3 = data[col].quantile(0.75)
 
     iqr = q3 - q1
+
     upper_bound = q3 + (1.5 * iqr)
 
     high_outliers = data[
@@ -313,9 +237,10 @@ for col in numeric_check_columns:
                     "qualification_code",
                     "site_id"
                 ]
-            ]
-            .sort_values(by=col, ascending=False)
-            .head(10)
+            ].sort_values(
+                by=col,
+                ascending=False
+            )
         )
 
 
