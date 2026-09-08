@@ -46,11 +46,7 @@ print("Duplicate confirmation numbers:", data["confirmation_number"].duplicated(
 print("\nRows per month:")
 print(data["month"].value_counts())
 
-#saving cleaned data for the next cleaning step
-data.to_parquet("data/combined_person1_clean.parquet", index=False)
-
-
-
+#beofre
 
 original_row_count = len(data)
 
@@ -74,9 +70,7 @@ print("\nRATE CODE COUNTS BEFORE CLEANING")
 print(rate_code_counts_before)
 
 
-# --------------------------------------------------
-# 1. MAKE IDS STRINGS
-# --------------------------------------------------
+#turning IDS to strings
 
 id_columns = [
     "confirmation_number",
@@ -88,9 +82,6 @@ for col in id_columns:
     data[col] = data[col].astype("string")
 
 
-# --------------------------------------------------
-# 2. CHECK CONFIRMATION NUMBER UNIQUENESS
-# --------------------------------------------------
 
 duplicate_confirmations = data[
     data["confirmation_number"].duplicated(keep=False)
@@ -104,13 +95,11 @@ else:
     print(
         duplicate_confirmations[
             ["confirmation_number", "site_id", "check_in_date", "check_out_date"]
-        ]
+        ].head(10)
     )
 
 
-# --------------------------------------------------
-# 3. CHECK SRB POINTS REDEEMED
-# --------------------------------------------------
+#SRB points redeemed
 
 invalid_srb = data[
     (data["rate_code"] == "SRB")
@@ -118,6 +107,11 @@ invalid_srb = data[
         data["points_redeemed"].isna()
         | (data["points_redeemed"] == 0)
     )
+]
+
+non_srb_with_points = data[
+    (data["rate_code"] != "SRB")
+    & (data["points_redeemed"].notna())
 ]
 
 print("\nSRB RECORDS WITH MISSING OR ZERO POINTS_REDEEMED")
@@ -134,61 +128,14 @@ else:
                 "site_id",
                 "check_in_date"
             ]
-        ]
+        ].head(10)
     )
 
-
-# SRB rows missing points_redeemed
-srb_missing_points = data[
-    (data["rate_code"] == "SRB")
-    & (data["points_redeemed"].isna())
-]
-
-print("\nSRB ROWS MISSING POINTS_REDEEMED")
-
-if srb_missing_points.empty:
-    print("None found.")
-else:
-    print(
-        srb_missing_points[
-            [
-                "confirmation_number",
-                "rate_code",
-                "points_redeemed",
-                "site_id",
-                "check_in_date"
-            ]
-        ]
-    )
+print("\nNON-SRB RECORDS WITH POINTS_REDEEMED")
+print("Count:", len(non_srb_with_points))
 
 
-# non-SRB rows that have points_redeemed
-non_srb_with_points = data[
-    (data["rate_code"] != "SRB")
-    & (data["points_redeemed"].notna())
-]
-
-print("\nNON-SRB ROWS WITH POINTS_REDEEMED")
-
-if non_srb_with_points.empty:
-    print("None found.")
-else:
-    print(
-        non_srb_with_points[
-            [
-                "confirmation_number",
-                "rate_code",
-                "points_redeemed",
-                "site_id",
-                "check_in_date"
-            ]
-        ]
-    )
-# --------------------------------------------------
-# 4. FILL MISSING POINTS_REDEEMED WITH 0
-# --------------------------------------------------
-
-# data["points_redeemed"] = data["points_redeemed"] * -1
+#missing points redeeemd rows with 0
 
 missing_points_redeemed_before = data["points_redeemed"].isna().sum()
 
@@ -198,9 +145,7 @@ print("\nMISSING POINTS_REDEEMED FILLED WITH 0")
 print("Rows changed:", missing_points_redeemed_before)
 
 
-# --------------------------------------------------
-# 5. FLAG NON-MEMBERS WITH POINTS_EARNED != 0
-# --------------------------------------------------
+#flagging non memebers but with points earned/redeemed
 
 nonmember_points_issue = data[
     data["member_number"].isna()
@@ -221,18 +166,15 @@ else:
                 "rate_code",
                 "site_id"
             ]
-        ]
+        ].head(10)
     )
 
 
-# --------------------------------------------------
-# 6. FLAG NEGATIVE VALUES
-# --------------------------------------------------
+#Flagging any negative values
 
 numeric_check_columns = [
     "room_revenue",
-    "points_earned",
-
+    "points_earned"
 ]
 
 for col in numeric_check_columns:
@@ -240,9 +182,10 @@ for col in numeric_check_columns:
     negative_rows = data[data[col] < 0]
 
     print(f"\nNEGATIVE VALUES IN {col.upper()}")
-    print("Number of flagged rows:", len(negative_rows))
 
-    if not negative_rows.empty:
+    if negative_rows.empty:
+        print("None found.")
+    else:
         print(
             negative_rows[
                 [
@@ -255,19 +198,19 @@ for col in numeric_check_columns:
             ].head(10)
         )
 
+print("\nNEGATIVE VALUES IN POINTS_REDEEMED")
+print("Count:", (data["points_redeemed"] < 0).sum())
+print("Negative points_redeemed values are expected for redemptions.")
 
 
-
-# --------------------------------------------------
-# 7. FLAG ROOM_REVENUE = 0
-# --------------------------------------------------
+#flagging room_revenue = 0
 
 zero_room_revenue = data[
     data["room_revenue"] == 0
 ]
 
 print("\nROOM_REVENUE = 0")
-print("Number of flagged rows:", len(zero_room_revenue))
+print("Count:", len(zero_room_revenue))
 
 if not zero_room_revenue.empty:
     print(
@@ -283,16 +226,17 @@ if not zero_room_revenue.empty:
             ]
         ].head(10)
     )
-# --------------------------------------------------
-# 8. FLAG HIGH OUTLIERS USING IQR
-# --------------------------------------------------
 
-for col in numeric_check_columns:
+
+#flagging IQR using outliers
+
+for col in ["room_revenue", "points_earned"]:
 
     q1 = data[col].quantile(0.25)
     q3 = data[col].quantile(0.75)
 
     iqr = q3 - q1
+
     upper_bound = q3 + (1.5 * iqr)
 
     high_outliers = data[
@@ -313,15 +257,14 @@ for col in numeric_check_columns:
                     "qualification_code",
                     "site_id"
                 ]
-            ]
-            .sort_values(by=col, ascending=False)
-            .head(10)
+            ].sort_values(
+                by=col,
+                ascending=False
+            ).head(10)
         )
 
 
-# --------------------------------------------------
-# 9. AFTER CLEANING COUNTS
-# --------------------------------------------------
+#counts after clean
 
 final_row_count = len(data)
 
@@ -345,9 +288,7 @@ print("\nRATE CODE COUNTS AFTER CLEANING")
 print(rate_code_counts_after)
 
 
-# --------------------------------------------------
-# 10. VERIFY NOTHING WAS REMOVED
-# --------------------------------------------------
+#verifying if anything is removed
 
 print("\nROW COUNT CHECK")
 
@@ -375,3 +316,17 @@ if rate_code_counts_before.equals(rate_code_counts_after):
     print("PASS: All rate_code counts stayed the same.")
 else:
     print("WARNING: rate_code counts changed.")
+
+
+print("\nQNS/QXY COUNTS")
+print(
+    data[data["qualification_code"].isin(["QNS", "QXY"])]
+    ["qualification_code"]
+    .value_counts()
+)
+
+#saving cleaned data
+
+data.to_parquet("data/combined_cleaned.parquet", index=False)
+
+print("\nFinal cleaned data saved.")
