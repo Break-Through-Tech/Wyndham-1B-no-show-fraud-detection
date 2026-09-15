@@ -1,6 +1,6 @@
 # data files (staying local)
-data/*.csv
-!data/data_dictionary.csv
+data/**/*.csv
+*.parquet
 
 __pycache__/
 *.pyc
