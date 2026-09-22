@@ -375,3 +375,5 @@ if rate_code_counts_before.equals(rate_code_counts_after):
     print("PASS: All rate_code counts stayed the same.")
 else:
     print("WARNING: rate_code counts changed.")
+
+data.to_parquet("data/combined_cleaned.parquet", index=False)
