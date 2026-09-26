@@ -10,7 +10,7 @@
 
 | Name             | GitHub Handle | Contribution                                                             |
 |------------------|---------------|--------------------------------------------------------------------------|
-| Amina Waqar      | waqara1-ui    | Data exploration, visualization, overall project coordination            |
+| Amina Waqar      | waqara1-ui    | Product Management, Data exploration, visualization, EDA                 |
 | Jordan Ramirez   | @jramirez     | Data collection, exploratory data analysis (EDA), dataset documentation  |
 | Amina Hassan     | @aminahassan  | Data preprocessing, feature engineering, data validation                 |
 | Priya Mehta      | @pmehta       | Model selection, hyperparameter tuning, model training and optimization  |
