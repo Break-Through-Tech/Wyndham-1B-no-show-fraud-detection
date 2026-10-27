@@ -50,6 +50,15 @@ july["month"] = "July"
 #Combining months
 combined_months = pd.concat([may, june, july], ignore_index=True)
 
+#checking  whether reservation IDs appear in multiple months
+overlap = (
+    combined_months.groupby("confirmation_number")["month"]
+    .nunique()
+)
+
+print("\nReservations appearing in multiple months:",
+      (overlap > 1).sum())
+
 print("\nCOMBINED MONTHS")
 print("Rows:", len(combined_months))
 print("Columns:", len(combined_months.columns))
