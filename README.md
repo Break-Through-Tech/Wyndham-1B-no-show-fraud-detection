@@ -13,7 +13,7 @@
 
 | Name | Email | Contributions |
 |---|---|---|
-| Amina Waqar | aminawaqar506@gmail.com | Project management, synthetic Revision 4 data ingestion and cleaning, QNS/QXY status code analysis, baseline modeling |
+| Amina Waqar | aminawaqar506@gmail.com | Project management, data ingestion and cleaning, QNS/QXY status code analysis, feature engineering, baseline modeling |
 | Sweta Valisammagari | swetavalisammagari@gmail.com | Exploratory data analysis, points earned and velocity versus SRB redemption behavioral analysis, feature engineering |
 | Kaden Phabmixay | Phabmixaykaden@gmail.com | Booking dynamics, lead time and length-of-stay feature engineering, PRD documentation, UI/UX dashboard wireframing |
 | Sai | To be added | Decision tree evaluation, baseline comparisons, machine learning pipeline and tech stack integration |
