@@ -1,5 +1,5 @@
 
-# Wyndham Fraud Risk Intelligence Hub
+# Wyndham Fraud Risk Intelligence
 ### Loyalty Abuse and Reservation Fraud Detection
 
 **Break Through Tech AI Studio Challenge Project — Fall 2026**
