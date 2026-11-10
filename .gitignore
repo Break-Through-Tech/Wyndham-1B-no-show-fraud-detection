@@ -1,11 +1,29 @@
-# data files (staying local)
+# Data files (stay local)
 data/**/*.csv
 *.parquet
 
+# Node.js dependencies
+node_modules/
+dist/
+
+# Python cache
 __pycache__/
 *.pyc
 
-# Virtual environment
+# Virtual environments
 .venv/
 venv/
-*.parquet
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Local ZIP archives
+*.zip
+
+# OS files
+.DS_Store
+Thumbs.db
+
+dashboard_backend/test_uploads/

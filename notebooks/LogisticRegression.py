@@ -14,6 +14,8 @@ from sklearn.metrics import (
     average_precision_score,
     confusion_matrix
 )
+from pathlib import Path
+import joblib
 
 
 # ==========================================
@@ -486,3 +488,10 @@ print_coefficients(
 )
 
 print_coefficients("MODEL 2", model2)
+
+#saving trained Model 2 for dashboard predictions
+
+Path("models").mkdir(exist_ok=True)
+joblib.dump(model2, "models/model2_pipeline.joblib")
+
+print("Model 2 saved successfully!")
