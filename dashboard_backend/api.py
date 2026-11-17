@@ -1,5 +1,13 @@
 
 from io import BytesIO
+import hashlib
+import json
+import sqlite3
+from datetime import datetime, timezone
+from typing import Literal
+from pydantic import BaseModel, Field
+import math
+import numbers
 from pathlib import Path
 import sys
 
@@ -18,7 +26,7 @@ app.add_middleware(
         "http://127.0.0.1:5173",
     ],
     allow_credentials=False,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["*"],
 )
 
@@ -62,13 +70,16 @@ def predict(
     reservations: UploadFile = File(...),
     stays: UploadFile = File(...),
 ):
-    # Read uploaded files
-    reservation_data = read_upload(
-        reservations, reservations.file.read()
-    )
-    stay_data = read_upload(
-        stays, stays.file.read()
-    )
+    # Dataset identity is stable across identical re-uploads, independent of filenames.
+    reservation_bytes = reservations.file.read()
+    stay_bytes = stays.file.read()
+    digest = hashlib.sha256()
+    for content in (reservation_bytes, stay_bytes):
+        digest.update(len(content).to_bytes(8, "big"))
+        digest.update(content)
+    dataset_id = digest.hexdigest()[:24]
+    reservation_data = read_upload(reservations, reservation_bytes)
+    stay_data = read_upload(stays, stay_bytes)
 
     # Check required columns
     reservation_columns = {
@@ -161,13 +172,57 @@ def predict(
         results["fraud_prediction"] == 1
     ].sort_values("fraud_risk_score", ascending=False)
 
-    # Return flagged reservations for the dashboard
+    # Join prediction identifiers back to the uploaded reservation/stay data.
+    # This preserves the trained feature pipeline and exposes only fields
+    # genuinely supplied in the files (not inferred property/geography/SHAP).
+    detail_fields = [
+        "confirmation_number", "booking_timestamp", "check_in_date",
+        "check_out_date", "rate_code", "booking_channel",
+        "qualification_code", "points_earned", "points_redeemed",
+        "room_revenue", "member_enrollment_date",
+    ]
+    details = combined[detail_fields].set_index("confirmation_number")
+
+    def safe_value(value):
+        if pd.isna(value):
+            return None
+        if isinstance(value, pd.Timestamp):
+            return value.isoformat()
+        if isinstance(value, numbers.Number):
+            number = float(value)
+            return number if math.isfinite(number) else None
+        return str(value)
+
+    # Chart is a count of flagged reservations by *check-in date* in the
+    # uploaded batch, not an assertion about production monitoring history.
+    checkin_dates = pd.to_datetime(combined["check_in_date"], errors="coerce").dt.normalize()
+    latest = checkin_dates.max()
+    daily_trend = []
+    if pd.notna(latest):
+        flagged_ids = set(flagged["confirmation_number"].astype(str))
+        flags_by_day = combined.loc[
+            combined["confirmation_number"].astype(str).isin(flagged_ids),
+            ["check_in_date"],
+        ].copy()
+        flags_by_day["day"] = pd.to_datetime(
+            flags_by_day["check_in_date"], errors="coerce"
+        ).dt.normalize()
+        counts = flags_by_day.groupby("day").size()
+        for day in pd.date_range(end=latest, periods=30, freq="D"):
+            daily_trend.append({
+                "date": day.date().isoformat(),
+                "flagged_count": int(counts.get(day, 0)),
+            })
+
+    # Return flagged reservations and their uploaded context for the dashboard.
     return {
+        "dataset_id": dataset_id,
         "total_reservations": len(results),
         "flagged_reservations": len(flagged),
         "flagged_rate": round(
             len(flagged) / len(results) * 100, 4
         ),
+        "daily_trend": daily_trend,
         "predictions": [
             {
                 "confirmation_number": str(row.confirmation_number),
@@ -179,7 +234,75 @@ def predict(
                     float(row.fraud_risk_score), 6
                 ),
                 "fraud_prediction": int(row.fraud_prediction),
+                **{
+                    field: safe_value(details.loc[str(row.confirmation_number), field])
+                    for field in detail_fields
+                    if field != "confirmation_number"
+                },
             }
             for row in flagged.itertuples()
         ],
     }
+
+
+# Local prototype case store. Review decisions never modify model outputs.
+DB_PATH = Path(__file__).resolve().parent / "review_cases.sqlite3"
+
+
+def db_connection():
+    connection = sqlite3.connect(DB_PATH, timeout=30)
+    connection.execute("""CREATE TABLE IF NOT EXISTS case_reviews (
+        dataset_id TEXT NOT NULL,
+        confirmation_number TEXT NOT NULL,
+        status TEXT NOT NULL,
+        notes_json TEXT NOT NULL DEFAULT '[]',
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (dataset_id, confirmation_number)
+    )""")
+    return connection
+
+
+class CaseUpdate(BaseModel):
+    status: Literal["flagged", "reviewing", "cleared", "escalated", "confirmed_fraud"] | None = None
+    note: str | None = Field(default=None, max_length=5000)
+
+
+@app.get("/cases/{dataset_id}")
+def list_cases(dataset_id: str):
+    with db_connection() as connection:
+        rows = connection.execute(
+            "SELECT confirmation_number, status, notes_json, updated_at FROM case_reviews WHERE dataset_id = ?",
+            (dataset_id,),
+        ).fetchall()
+    return {"cases": {key: {"status": status, "notes": json.loads(notes), "updated_at": updated}
+                      for key, status, notes, updated in rows}}
+
+
+@app.patch("/cases/{dataset_id}/{confirmation_number}")
+def update_case(dataset_id: str, confirmation_number: str, change: CaseUpdate):
+    if not dataset_id or len(dataset_id) > 64 or not confirmation_number or len(confirmation_number) > 200:
+        raise HTTPException(status_code=400, detail="Invalid case identifier")
+    if change.status is None and not (change.note and change.note.strip()):
+        raise HTTPException(status_code=400, detail="Provide a status or a note")
+    with db_connection() as connection:
+        row = connection.execute(
+            "SELECT status, notes_json FROM case_reviews WHERE dataset_id = ? AND confirmation_number = ?",
+            (dataset_id, confirmation_number),
+        ).fetchone()
+        previous_status = row[0] if row else "flagged"
+        notes = json.loads(row[1]) if row else []
+        status = change.status or previous_status
+        if status in ("cleared", "escalated", "confirmed_fraud") and previous_status != "reviewing":
+            raise HTTPException(status_code=409, detail="Start or reopen review before closing the case")
+        if status in ("cleared", "escalated", "confirmed_fraud") and change.status is not None and not (change.note and change.note.strip()):
+            raise HTTPException(status_code=400, detail="A decision rationale is required")
+        now = datetime.now(timezone.utc).isoformat()
+        if change.note and change.note.strip():
+            notes.append({"text": change.note.strip(), "created_at": now})
+        connection.execute("""INSERT INTO case_reviews(dataset_id,confirmation_number,status,notes_json,updated_at)
+            VALUES(?,?,?,?,?) ON CONFLICT(dataset_id,confirmation_number) DO UPDATE SET
+            status=excluded.status, notes_json=excluded.notes_json, updated_at=excluded.updated_at""",
+            (dataset_id, confirmation_number, status, json.dumps(notes), now),
+        )
+        connection.commit()
+    return {"case": {"status": status, "notes": notes, "updated_at": now}}
