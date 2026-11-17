@@ -1,5 +1,5 @@
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 type FraudPrediction = {
   confirmation_number: string;
@@ -34,6 +34,43 @@ const API = "http://127.0.0.1:8000";
 const statusLabel: Record<CaseStatus,string> = {flagged:"Flagged",reviewing:"Under review",cleared:"Cleared · no further action",escalated:"Escalated",confirmed_fraud:"Confirmed fraud"};
 
 type SortOrder = "high" | "low";
+
+const CLOSED_STATUSES: CaseStatus[] = ["cleared", "escalated", "confirmed_fraud"];
+const STORAGE_KEY = "wyndham.lastAnalysis.v1";
+
+// Single source of truth for a row's status: queue tabs, counts, colors, export and modal all use this.
+function statusOf(cases: Record<string, CaseRecord>, confirmation: string): CaseStatus {
+  return cases[confirmation]?.status ?? "flagged";
+}
+function isClosed(status: CaseStatus) {
+  return CLOSED_STATUSES.includes(status);
+}
+function tabForStatus(status: CaseStatus): QueueTab {
+  return status === "flagged" ? "active" : status === "reviewing" ? "reviewing" : "reviewed";
+}
+
+function loadSavedAnalysis(): PredictionResponse | null {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (typeof data?.dataset_id === "string" && Array.isArray(data.predictions) && Array.isArray(data.daily_trend)
+      && typeof data.total_reservations === "number" && typeof data.flagged_reservations === "number") return data;
+  } catch { /* storage unavailable or corrupt: start empty */ }
+  return null;
+}
+function saveAnalysis(data: PredictionResponse | null) {
+  try {
+    if (data) window.localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    else window.localStorage.removeItem(STORAGE_KEY);
+  } catch { /* ignore quota/private-mode errors */ }
+}
+async function fetchCases(datasetId: string): Promise<Record<string, CaseRecord>> {
+  const response = await fetch(`${API}/cases/${encodeURIComponent(datasetId)}`);
+  if (!response.ok) throw new Error("Could not load saved review decisions.");
+  const saved = await response.json();
+  return saved.cases ?? {};
+}
 
 function displayValue(value: string | number | null | undefined) {
   return value === null || value === undefined || value === "" ? "Not available" : String(value);
@@ -148,7 +185,10 @@ function RiskBadge({ score }: { score: number }) {
 }
 
 function csvEscape(value: unknown) {
-  return `"${String(value ?? "").replaceAll('"', '""')}"`;
+  let text = String(value ?? "");
+  // Neutralize spreadsheet formulas in analyst-entered text (CSV injection).
+  if (/^[=+@-]/.test(text) && typeof value === "string") text = `'${text}`;
+  return `"${text.replace(/"/g, '""')}"`;
 }
 
 export default function App() {
@@ -178,6 +218,35 @@ export default function App() {
   const [caseError, setCaseError] = useState("");
   const [caseNotice, setCaseNotice] = useState("");
 
+  const [restoredNotice, setRestoredNotice] = useState("");
+
+  // After a browser refresh, restore the last analysis and re-read every decision/note from the backend.
+  useEffect(() => {
+    const saved = loadSavedAnalysis();
+    if (!saved) return;
+    let cancelled = false;
+    fetchCases(saved.dataset_id)
+      .then(savedCases => {
+        if (cancelled) return;
+        setCases(savedCases);
+        setPredictionResults(saved);
+        setRestoredNotice("Restored your last analysis. Decisions and notes were reloaded from the saved case store.");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // Do not show restored rows with default statuses: that would misrepresent saved decisions.
+        setUploadError("Could not reach the backend to reload saved decisions. Start the API and refresh, or upload the files again.");
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!selectedConfirmation) return;
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") void closeCase(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
+
   const flaggedRows = useMemo(() => {
     if (!predictionResults) return [];
 
@@ -187,7 +256,8 @@ export default function App() {
   }, [predictionResults]);
 
   const dailyTrend = predictionResults?.daily_trend ?? [];
-  const chartMax = Math.max(1, ...dailyTrend.map((day) => day.flagged_count));
+  // Round up to a multiple of 3 so the four axis ticks are exact whole numbers.
+  const chartMax = Math.ceil(Math.max(1, ...dailyTrend.map((day) => day.flagged_count)) / 3) * 3;
 
   const uniqueMembers = useMemo(() => {
     return new Set(
@@ -205,10 +275,7 @@ export default function App() {
 
     return flaggedRows
       .filter(row => {
-        const status = cases[row.confirmation_number]?.status ?? "flagged";
-        if (queueTab === "active") return status === "flagged";
-        if (queueTab === "reviewing") return status === "reviewing";
-        return status === "cleared" || status === "escalated" || status === "confirmed_fraud";
+        return tabForStatus(statusOf(cases, row.confirmation_number)) === queueTab;
       })
       .filter(row => !selectedDay || row.check_in_date?.slice(0,10) === selectedDay)
       .filter((row) => {
@@ -240,6 +307,8 @@ export default function App() {
     setIsUploading(true);
     setUploadError("");
     setPredictionResults(null);
+    setRestoredNotice("");
+    saveAnalysis(null);
     setSelectedConfirmation(null);
     setCases({});
     setQueueTab("active");
@@ -284,11 +353,10 @@ export default function App() {
       }
 
       if (typeof data.dataset_id !== "string") throw new Error("Backend needs the updated api.py (dataset_id missing).");
-      const caseResponse = await fetch(`${API}/cases/${data.dataset_id}`);
-      if (!caseResponse.ok) throw new Error("Could not load saved review decisions.");
-      const saved = await caseResponse.json();
-      setCases(saved.cases ?? {});
+      const savedCases = await fetchCases(data.dataset_id);
+      setCases(savedCases);
       setPredictionResults(data as PredictionResponse);
+      saveAnalysis(data as PredictionResponse);
     } catch (error) {
       setUploadError(
         error instanceof Error
@@ -322,7 +390,7 @@ export default function App() {
       row.check_in_date, row.check_out_date, row.booking_timestamp,
       row.rate_code, row.booking_channel, row.qualification_code,
       row.points_earned, row.points_redeemed, row.room_revenue,
-      statusLabel[cases[row.confirmation_number]?.status ?? "flagged"],
+      statusLabel[statusOf(cases, row.confirmation_number)],
       (cases[row.confirmation_number]?.notes ?? []).map(n => n.text).join(" | "),
       row.member_enrollment_date,
     ]);
@@ -347,7 +415,7 @@ export default function App() {
 
   async function updateCase(confirmation: string, status?: CaseStatus, note?: string): Promise<boolean> {
     if (!predictionResults || caseBusy) return false;
-    if (status && ["cleared","escalated","confirmed_fraud"].includes(status) && !note?.trim()) { setCaseError("Write a decision rationale in the note field before closing this case."); return false; }
+    if (status && isClosed(status) && !note?.trim()) { setCaseError("Write a decision rationale in the note field before closing this case."); return false; }
     setCaseBusy(true);
     setCaseError("");
     setCaseNotice("");
@@ -360,12 +428,9 @@ export default function App() {
       if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Could not save review.");
       setCases(current => ({...current, [confirmation]: data.case}));
       if (note?.trim()) setComment("");
-      setCaseNotice(`Saved ${new Date().toLocaleTimeString([], {hour: "numeric", minute: "2-digit"})}`);
-      if (status === "cleared" || status === "escalated" || status === "confirmed_fraud") {
-        setQueueTab("reviewed");
-      }
-      if (status === "flagged") setQueueTab("active");
-      if (status === "reviewing") setQueueTab("reviewing");
+      setCaseNotice(`Saved ${new Date().toLocaleTimeString([], {hour: "numeric", minute: "2-digit"})}${status ? ` · moved to ${tabForStatus(status) === "active" ? "Active" : tabForStatus(status) === "reviewing" ? "Under Review" : "Reviewed"}` : ""}`);
+      // Follow the case into the tab it now belongs to, so it never appears to vanish.
+      if (status) setQueueTab(tabForStatus(status));
       return true;
     } catch (error) {
       setCaseError(error instanceof Error ? error.message : "Could not save review.");
@@ -395,9 +460,11 @@ export default function App() {
   const currentCase = selected ? cases[selected.confirmation_number] : undefined;
   const currentComments = currentCase?.notes ?? [];
   const currentStatus = currentCase?.status ?? "flagged";
-  const activeCount = flaggedRows.filter(r => (cases[r.confirmation_number]?.status ?? "flagged") === "flagged").length;
-  const reviewingCount = flaggedRows.filter(r => cases[r.confirmation_number]?.status === "reviewing").length;
-  const reviewedCount = flaggedRows.length - activeCount - reviewingCount;
+  const tabCounts = { active: 0, reviewing: 0, reviewed: 0 };
+  for (const r of flaggedRows) tabCounts[tabForStatus(statusOf(cases, r.confirmation_number))] += 1;
+  const activeCount = tabCounts.active;
+  const reviewingCount = tabCounts.reviewing;
+  const reviewedCount = tabCounts.reviewed;
   const pointsExposure = flaggedRows.reduce((sum,row) => sum + Math.max(0, row.points_earned ?? 0),0);
   const completedCount = reviewedCount;
   const completedPct = flaggedRows.length ? 100 * completedCount / flaggedRows.length : 0;
@@ -595,6 +662,7 @@ export default function App() {
                   {predictionResults.flagged_rate}%
                   {" "}flagged rate
                 </p>
+                {restoredNotice && <p style={{ color: "#475569", marginBottom: 0, fontSize: "13px" }}>{restoredNotice}</p>}
               </div>
             )}
           </div>
@@ -654,8 +722,8 @@ export default function App() {
             <div className="chart">
               <div className="y-axis">
                 <span>{chartMax}</span>
-                <span>{Math.round(chartMax * 2 / 3)}</span>
-                <span>{Math.round(chartMax / 3)}</span>
+                <span>{chartMax * 2 / 3}</span>
+                <span>{chartMax / 3}</span>
                 <span>0</span>
               </div>
               <div className="chart-body">
@@ -665,7 +733,7 @@ export default function App() {
                     <button type="button" className={`bar-column day-button ${selectedDay === day.date ? "day-selected" : ""}`} key={day.date}
                       aria-label={`Filter cases for ${day.date}: ${day.flagged_count} flagged`}
                       title={`${day.date}: ${day.flagged_count} flagged — click to filter queue`}
-                      onClick={() => {setSelectedDay(current => current === day.date ? null : day.date);setQueueTab("active");}} >
+                      onClick={() => {setSelectedDay(current => current === day.date ? null : day.date);}} >
                       <div className={`bar ${index === dailyTrend.length - 1 ? "active" : ""}`}
                         style={{ height: `${(day.flagged_count / chartMax) * 100}%` }} />
                     </button>
@@ -846,7 +914,9 @@ export default function App() {
                       onClick={() => { openCase(row.confirmation_number); }}
                     >
                       <td>
-                        {(cases[row.confirmation_number]?.status ?? "flagged") === "cleared" ? <span className="decision-pill cleared">✓ Cleared</span> : <RiskBadge score={row.fraud_risk_score} />}
+                        {statusOf(cases, row.confirmation_number) === "flagged"
+                          ? <RiskBadge score={row.fraud_risk_score} />
+                          : <span className={`decision-pill ${statusOf(cases, row.confirmation_number)}`}>{statusOf(cases, row.confirmation_number) === "cleared" ? "✓ " : ""}{statusLabel[statusOf(cases, row.confirmation_number)].split(" · ")[0]}</span>}
                       </td>
 
                       <td>
@@ -866,11 +936,11 @@ export default function App() {
                       </td>
 
                       <td>
-                        <strong className={`explanation status-${cases[row.confirmation_number]?.status ?? "flagged"}`}>
-                          {statusLabel[cases[row.confirmation_number]?.status ?? "flagged"]}
+                        <strong className={`explanation status-${statusOf(cases, row.confirmation_number)}`}>
+                          {statusLabel[statusOf(cases, row.confirmation_number)]}
                         </strong>
 
-                        <span className="cell-detail">Original model risk: {(row.fraud_risk_score * 100).toFixed(0)}%</span>
+                        <span className="cell-detail">Original model risk: {(row.fraud_risk_score * 100).toFixed(0)}%{(cases[row.confirmation_number]?.notes.length ?? 0) > 0 ? ` · ${cases[row.confirmation_number].notes.length} note${cases[row.confirmation_number].notes.length === 1 ? "" : "s"}` : ""}</span>
                       </td>
 
                       <td>
@@ -1001,7 +1071,7 @@ export default function App() {
                     </div>
                   </aside>
                 </div>
-                <footer className="case-modal-footer">Local demonstration only · No accounts, loyalty points, or bookings are changed. <button type="button" disabled={caseBusy} onClick={()=>void closeCase()}>{caseBusy ? "Saving…" : comment.trim() ? "Save & close" : "Close case"}</button></footer>
+                <footer className="case-modal-footer">Local demonstration only · No accounts, loyalty points, or bookings are changed. <button type="button" disabled={caseBusy} onClick={()=>void closeCase()}>{caseBusy ? "Saving…" : comment.trim() ? "Save note & close" : "Close"}</button></footer>
               </section>
             </div>
           )}

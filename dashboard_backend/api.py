@@ -2,7 +2,9 @@
 from io import BytesIO
 import hashlib
 import json
+import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Literal
 from pydantic import BaseModel, Field
@@ -246,20 +248,36 @@ def predict(
 
 
 # Local prototype case store. Review decisions never modify model outputs.
-DB_PATH = Path(__file__).resolve().parent / "review_cases.sqlite3"
+# WYNDHAM_REVIEW_DB is only meant for tests; the default is the real store.
+DB_PATH = Path(os.environ.get("WYNDHAM_REVIEW_DB") or Path(__file__).resolve().parent / "review_cases.sqlite3")
+CLOSED_STATUSES = ("cleared", "escalated", "confirmed_fraud")
 
 
+@contextmanager
 def db_connection():
-    connection = sqlite3.connect(DB_PATH, timeout=30)
-    connection.execute("""CREATE TABLE IF NOT EXISTS case_reviews (
-        dataset_id TEXT NOT NULL,
-        confirmation_number TEXT NOT NULL,
-        status TEXT NOT NULL,
-        notes_json TEXT NOT NULL DEFAULT '[]',
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY (dataset_id, confirmation_number)
-    )""")
-    return connection
+    # isolation_level=None -> we control transactions explicitly (BEGIN IMMEDIATE),
+    # and the connection is always closed (sqlite3's own `with` only commits).
+    connection = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+    try:
+        connection.execute("""CREATE TABLE IF NOT EXISTS case_reviews (
+            dataset_id TEXT NOT NULL,
+            confirmation_number TEXT NOT NULL,
+            status TEXT NOT NULL,
+            notes_json TEXT NOT NULL DEFAULT '[]',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (dataset_id, confirmation_number)
+        )""")
+        yield connection
+    finally:
+        connection.close()
+
+
+def parse_notes(raw):
+    try:
+        notes = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return notes if isinstance(notes, list) else []
 
 
 class CaseUpdate(BaseModel):
@@ -274,35 +292,42 @@ def list_cases(dataset_id: str):
             "SELECT confirmation_number, status, notes_json, updated_at FROM case_reviews WHERE dataset_id = ?",
             (dataset_id,),
         ).fetchall()
-    return {"cases": {key: {"status": status, "notes": json.loads(notes), "updated_at": updated}
+    return {"cases": {key: {"status": status, "notes": parse_notes(notes), "updated_at": updated}
                       for key, status, notes, updated in rows}}
 
 
-@app.patch("/cases/{dataset_id}/{confirmation_number}")
+@app.patch("/cases/{dataset_id}/{confirmation_number:path}")
 def update_case(dataset_id: str, confirmation_number: str, change: CaseUpdate):
     if not dataset_id or len(dataset_id) > 64 or not confirmation_number or len(confirmation_number) > 200:
         raise HTTPException(status_code=400, detail="Invalid case identifier")
-    if change.status is None and not (change.note and change.note.strip()):
+    note = change.note.strip() if change.note else ""
+    if change.status is None and not note:
         raise HTTPException(status_code=400, detail="Provide a status or a note")
     with db_connection() as connection:
-        row = connection.execute(
-            "SELECT status, notes_json FROM case_reviews WHERE dataset_id = ? AND confirmation_number = ?",
-            (dataset_id, confirmation_number),
-        ).fetchone()
-        previous_status = row[0] if row else "flagged"
-        notes = json.loads(row[1]) if row else []
-        status = change.status or previous_status
-        if status in ("cleared", "escalated", "confirmed_fraud") and previous_status != "reviewing":
-            raise HTTPException(status_code=409, detail="Start or reopen review before closing the case")
-        if status in ("cleared", "escalated", "confirmed_fraud") and change.status is not None and not (change.note and change.note.strip()):
-            raise HTTPException(status_code=400, detail="A decision rationale is required")
-        now = datetime.now(timezone.utc).isoformat()
-        if change.note and change.note.strip():
-            notes.append({"text": change.note.strip(), "created_at": now})
-        connection.execute("""INSERT INTO case_reviews(dataset_id,confirmation_number,status,notes_json,updated_at)
-            VALUES(?,?,?,?,?) ON CONFLICT(dataset_id,confirmation_number) DO UPDATE SET
-            status=excluded.status, notes_json=excluded.notes_json, updated_at=excluded.updated_at""",
-            (dataset_id, confirmation_number, status, json.dumps(notes), now),
-        )
-        connection.commit()
+        # Take the write lock before reading so concurrent saves cannot lose notes.
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = connection.execute(
+                "SELECT status, notes_json FROM case_reviews WHERE dataset_id = ? AND confirmation_number = ?",
+                (dataset_id, confirmation_number),
+            ).fetchone()
+            previous_status = row[0] if row else "flagged"
+            notes = parse_notes(row[1]) if row else []
+            status = change.status or previous_status
+            if change.status in CLOSED_STATUSES and previous_status != "reviewing":
+                raise HTTPException(status_code=409, detail="Start or reopen review before closing the case")
+            if change.status in CLOSED_STATUSES and not note:
+                raise HTTPException(status_code=400, detail="A decision rationale is required")
+            now = datetime.now(timezone.utc).isoformat()
+            if note:
+                notes.append({"text": note, "created_at": now})
+            connection.execute("""INSERT INTO case_reviews(dataset_id,confirmation_number,status,notes_json,updated_at)
+                VALUES(?,?,?,?,?) ON CONFLICT(dataset_id,confirmation_number) DO UPDATE SET
+                status=excluded.status, notes_json=excluded.notes_json, updated_at=excluded.updated_at""",
+                (dataset_id, confirmation_number, status, json.dumps(notes), now),
+            )
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
     return {"case": {"status": status, "notes": notes, "updated_at": now}}

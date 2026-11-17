@@ -557,3 +557,4 @@ th:nth-child(7) { width: 144px; }
 .case-modal-footer { flex-wrap: wrap; }
 @media(max-width: 1050px) { .summary-column { grid-template-columns: repeat(2,minmax(0,1fr)); } }
 @media(max-width: 650px) { .summary-column { grid-template-columns: minmax(0,1fr); } }
+.member-link { border-bottom: 0; cursor: default; } /* not clickable: no link underline */
