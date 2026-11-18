@@ -1,28 +1,88 @@
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 type FraudPrediction = {
   confirmation_number: string;
   member_number: string | null;
   fraud_risk_score: number;
   fraud_prediction: number;
+  booking_timestamp: string | null;
+  check_in_date: string | null;
+  check_out_date: string | null;
+  rate_code: string | null;
+  booking_channel: string | null;
+  qualification_code: string | null;
+  points_earned: number | null;
+  points_redeemed: number | null;
+  room_revenue: number | null;
+  member_enrollment_date: string | null;
 };
 
 type PredictionResponse = {
+  dataset_id: string;
   total_reservations: number;
   flagged_reservations: number;
   flagged_rate: number;
   predictions: FraudPrediction[];
+  daily_trend: { date: string; flagged_count: number }[];
 };
 
-type ModelView = "details" | "comparison";
+type CaseStatus = "flagged" | "reviewing" | "cleared" | "escalated" | "confirmed_fraud";
+type CaseRecord = { status: CaseStatus; notes: {text:string; created_at:string}[]; updated_at: string | null };
+type QueueTab = "active" | "reviewing" | "reviewed";
+const API = "http://127.0.0.1:8000";
+const statusLabel: Record<CaseStatus,string> = {flagged:"Flagged",reviewing:"Under review",cleared:"Cleared · no further action",escalated:"Escalated",confirmed_fraud:"Confirmed fraud"};
+
 type SortOrder = "high" | "low";
 
-const trendData = [
-  26, 18, 31, 23, 37, 19, 28, 41, 24, 34,
-  21, 39, 29, 44, 32, 25, 38, 46, 35, 22,
-  39, 43, 31, 48, 36, 42, 57, 39, 51, 33,
-];
+const CLOSED_STATUSES: CaseStatus[] = ["cleared", "escalated", "confirmed_fraud"];
+const STORAGE_KEY = "wyndham.lastAnalysis.v1";
+
+// Single source of truth for a row's status: queue tabs, counts, colors, export and modal all use this.
+function statusOf(cases: Record<string, CaseRecord>, confirmation: string): CaseStatus {
+  return cases[confirmation]?.status ?? "flagged";
+}
+function isClosed(status: CaseStatus) {
+  return CLOSED_STATUSES.includes(status);
+}
+function tabForStatus(status: CaseStatus): QueueTab {
+  return status === "flagged" ? "active" : status === "reviewing" ? "reviewing" : "reviewed";
+}
+
+function loadSavedAnalysis(): PredictionResponse | null {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (typeof data?.dataset_id === "string" && Array.isArray(data.predictions) && Array.isArray(data.daily_trend)
+      && typeof data.total_reservations === "number" && typeof data.flagged_reservations === "number") return data;
+  } catch { /* storage unavailable or corrupt: start empty */ }
+  return null;
+}
+function saveAnalysis(data: PredictionResponse | null) {
+  try {
+    if (data) window.localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    else window.localStorage.removeItem(STORAGE_KEY);
+  } catch { /* ignore quota/private-mode errors */ }
+}
+async function fetchCases(datasetId: string): Promise<Record<string, CaseRecord>> {
+  const response = await fetch(`${API}/cases/${encodeURIComponent(datasetId)}`);
+  if (!response.ok) throw new Error("Could not load saved review decisions.");
+  const saved = await response.json();
+  return saved.cases ?? {};
+}
+
+function displayValue(value: string | number | null | undefined) {
+  return value === null || value === undefined || value === "" ? "Not available" : String(value);
+}
+
+function formatDate(value: string | null) {
+  return value ? value.slice(0, 10) : "Not available";
+}
+
+function formatNumber(value: number | null) {
+  return value === null ? "Not available" : value.toLocaleString();
+}
 
 function Icon({
   name,
@@ -125,7 +185,10 @@ function RiskBadge({ score }: { score: number }) {
 }
 
 function csvEscape(value: unknown) {
-  return `"${String(value ?? "").replaceAll('"', '""')}"`;
+  let text = String(value ?? "");
+  // Neutralize spreadsheet formulas in analyst-entered text (CSV injection).
+  if (/^[=+@-]/.test(text) && typeof value === "string") text = `'${text}`;
+  return `"${text.replace(/"/g, '""')}"`;
 }
 
 export default function App() {
@@ -142,19 +205,47 @@ export default function App() {
   const [uploadError, setUploadError] = useState("");
 
   const [search, setSearch] = useState("");
+  const [selectedDay, setSelectedDay] = useState<string | null>(null);
   const [sortOrder, setSortOrder] = useState<SortOrder>("high");
   const [selectedConfirmation, setSelectedConfirmation] =
     useState<string | null>(null);
 
-  const [modelView, setModelView] =
-    useState<ModelView>("comparison");
 
   const [comment, setComment] = useState("");
-  const [savedComments, setSavedComments] =
-    useState<Record<string, string[]>>({});
+  const [cases, setCases] = useState<Record<string,CaseRecord>>({});
+  const [queueTab, setQueueTab] = useState<QueueTab>("active");
+  const [caseBusy, setCaseBusy] = useState(false);
+  const [caseError, setCaseError] = useState("");
+  const [caseNotice, setCaseNotice] = useState("");
 
-  const [decisions, setDecisions] =
-    useState<Record<string, string>>({});
+  const [restoredNotice, setRestoredNotice] = useState("");
+
+  // After a browser refresh, restore the last analysis and re-read every decision/note from the backend.
+  useEffect(() => {
+    const saved = loadSavedAnalysis();
+    if (!saved) return;
+    let cancelled = false;
+    fetchCases(saved.dataset_id)
+      .then(savedCases => {
+        if (cancelled) return;
+        setCases(savedCases);
+        setPredictionResults(saved);
+        setRestoredNotice("Restored your last analysis. Decisions and notes were reloaded from the saved case store.");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // Do not show restored rows with default statuses: that would misrepresent saved decisions.
+        setUploadError("Could not reach the backend to reload saved decisions. Start the API and refresh, or upload the files again.");
+      });
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!selectedConfirmation) return;
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") void closeCase(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  });
 
   const flaggedRows = useMemo(() => {
     if (!predictionResults) return [];
@@ -163,6 +254,10 @@ export default function App() {
       (row) => row.fraud_prediction === 1
     );
   }, [predictionResults]);
+
+  const dailyTrend = predictionResults?.daily_trend ?? [];
+  // Round up to a multiple of 3 so the four axis ticks are exact whole numbers.
+  const chartMax = Math.ceil(Math.max(1, ...dailyTrend.map((day) => day.flagged_count)) / 3) * 3;
 
   const uniqueMembers = useMemo(() => {
     return new Set(
@@ -179,6 +274,10 @@ export default function App() {
     const query = search.trim().toLowerCase();
 
     return flaggedRows
+      .filter(row => {
+        return tabForStatus(statusOf(cases, row.confirmation_number)) === queueTab;
+      })
+      .filter(row => !selectedDay || row.check_in_date?.slice(0,10) === selectedDay)
       .filter((row) => {
         const content =
           `${row.confirmation_number} ${row.member_number ?? ""}`
@@ -191,17 +290,10 @@ export default function App() {
           ? b.fraud_risk_score - a.fraud_risk_score
           : a.fraud_risk_score - b.fraud_risk_score
       );
-  }, [flaggedRows, search, sortOrder]);
+  }, [flaggedRows, search, sortOrder, queueTab, cases, selectedDay]);
 
   const selected = useMemo(() => {
-    return (
-      flaggedRows.find(
-        (row) =>
-          row.confirmation_number === selectedConfirmation
-      ) ??
-      flaggedRows[0] ??
-      null
-    );
+    return flaggedRows.find(row => row.confirmation_number === selectedConfirmation) ?? null;
   }, [flaggedRows, selectedConfirmation]);
 
   async function handleUpload() {
@@ -215,8 +307,15 @@ export default function App() {
     setIsUploading(true);
     setUploadError("");
     setPredictionResults(null);
+    setRestoredNotice("");
+    saveAnalysis(null);
     setSelectedConfirmation(null);
+    setCases({});
+    setQueueTab("active");
+    setCaseError("");
+    setComment("");
     setSearch("");
+    setSelectedDay(null);
 
     try {
       const formData = new FormData();
@@ -225,7 +324,7 @@ export default function App() {
       formData.append("stays", staysFile);
 
       const response = await fetch(
-        "http://127.0.0.1:8000/predict",
+        `${API}/predict`,
         {
           method: "POST",
           body: formData,
@@ -245,14 +344,19 @@ export default function App() {
       if (
         typeof data.total_reservations !== "number" ||
         typeof data.flagged_reservations !== "number" ||
-        !Array.isArray(data.predictions)
+        !Array.isArray(data.predictions) ||
+        !Array.isArray(data.daily_trend)
       ) {
         throw new Error(
           "The backend returned an unexpected response."
         );
       }
 
+      if (typeof data.dataset_id !== "string") throw new Error("Backend needs the updated api.py (dataset_id missing).");
+      const savedCases = await fetchCases(data.dataset_id);
+      setCases(savedCases);
       setPredictionResults(data as PredictionResponse);
+      saveAnalysis(data as PredictionResponse);
     } catch (error) {
       setUploadError(
         error instanceof Error
@@ -272,13 +376,23 @@ export default function App() {
       "Confirmation Number",
       "Member Number",
       "Fraud Prediction",
+      "Check-in Date", "Check-out Date", "Booking Date",
+      "Rate Code", "Booking Channel", "Qualification Code",
+      "Points Earned", "Points Redeemed", "Room Revenue",
+      "Review Status", "Review Notes", "Member Enrollment Date",
     ];
 
-    const rows = visibleRows.map((row) => [
+    const rows = flaggedRows.map((row) => [
       row.fraud_risk_score,
       row.confirmation_number,
       row.member_number,
       row.fraud_prediction,
+      row.check_in_date, row.check_out_date, row.booking_timestamp,
+      row.rate_code, row.booking_channel, row.qualification_code,
+      row.points_earned, row.points_redeemed, row.room_revenue,
+      statusLabel[statusOf(cases, row.confirmation_number)],
+      (cases[row.confirmation_number]?.notes ?? []).map(n => n.text).join(" | "),
+      row.member_enrollment_date,
     ]);
 
     const csv = [header, ...rows]
@@ -293,44 +407,67 @@ export default function App() {
 
     const link = document.createElement("a");
     link.href = url;
-    link.download = "wyndham-model2-flagged-reservations.csv";
+    link.download = "wyndham-fraud-review-cases.csv";
     link.click();
 
     URL.revokeObjectURL(url);
   }
 
-  function saveComment() {
-    if (!selected || !comment.trim()) return;
+  async function updateCase(confirmation: string, status?: CaseStatus, note?: string): Promise<boolean> {
+    if (!predictionResults || caseBusy) return false;
+    if (status && isClosed(status) && !note?.trim()) { setCaseError("Write a decision rationale in the note field before closing this case."); return false; }
+    setCaseBusy(true);
+    setCaseError("");
+    setCaseNotice("");
+    try {
+      const response = await fetch(`${API}/cases/${predictionResults.dataset_id}/${encodeURIComponent(confirmation)}`, {
+        method: "PATCH", headers: {"Content-Type":"application/json"},
+        body: JSON.stringify({status: status ?? null, note: note?.trim() || null}),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : "Could not save review.");
+      setCases(current => ({...current, [confirmation]: data.case}));
+      if (note?.trim()) setComment("");
+      setCaseNotice(`Saved ${new Date().toLocaleTimeString([], {hour: "numeric", minute: "2-digit"})}${status ? ` · moved to ${tabForStatus(status) === "active" ? "Active" : tabForStatus(status) === "reviewing" ? "Under Review" : "Reviewed"}` : ""}`);
+      // Follow the case into the tab it now belongs to, so it never appears to vanish.
+      if (status) setQueueTab(tabForStatus(status));
+      return true;
+    } catch (error) {
+      setCaseError(error instanceof Error ? error.message : "Could not save review.");
+      return false;
+    } finally { setCaseBusy(false); }
+  }
 
-    const key = selected.confirmation_number;
+  async function closeCase() {
+    if (caseBusy || !selected) return;
+    // Save an unfinished note before closing. Keep the dialog open on failure.
+    if (comment.trim()) {
+      const saved = await updateCase(selected.confirmation_number, undefined, comment);
+      if (!saved) return;
+    }
+    setSelectedConfirmation(null);
+    setCaseNotice("");
+    setCaseError("");
+  }
 
-    setSavedComments((current) => ({
-      ...current,
-      [key]: [
-        ...(current[key] ?? []),
-        comment.trim(),
-      ],
-    }));
-
+  function openCase(confirmation: string) {
+    setSelectedConfirmation(confirmation);
     setComment("");
+    setCaseError("");
+    setCaseNotice("");
   }
 
-  function saveDecision(value: string) {
-    if (!selected) return;
-
-    setDecisions((current) => ({
-      ...current,
-      [selected.confirmation_number]: value,
-    }));
-  }
-
-  const currentComments = selected
-    ? savedComments[selected.confirmation_number] ?? []
-    : [];
-
-  const currentDecision = selected
-    ? decisions[selected.confirmation_number] ?? ""
-    : "";
+  const currentCase = selected ? cases[selected.confirmation_number] : undefined;
+  const currentComments = currentCase?.notes ?? [];
+  const currentStatus = currentCase?.status ?? "flagged";
+  const tabCounts = { active: 0, reviewing: 0, reviewed: 0 };
+  for (const r of flaggedRows) tabCounts[tabForStatus(statusOf(cases, r.confirmation_number))] += 1;
+  const activeCount = tabCounts.active;
+  const reviewingCount = tabCounts.reviewing;
+  const reviewedCount = tabCounts.reviewed;
+  const pointsExposure = flaggedRows.reduce((sum,row) => sum + Math.max(0, row.points_earned ?? 0),0);
+  const completedCount = reviewedCount;
+  const completedPct = flaggedRows.length ? 100 * completedCount / flaggedRows.length : 0;
 
   return (
     <div className="app-shell">
@@ -379,9 +516,7 @@ export default function App() {
                 <span className="kicker">
                   Fraud detection workspace
                 </span>
-                <span className="experimental-badge">
-                  Model 2 · Experimental
-                </span>
+
               </div>
 
               <h2 id="upload-heading">
@@ -527,6 +662,7 @@ export default function App() {
                   {predictionResults.flagged_rate}%
                   {" "}flagged rate
                 </p>
+                {restoredNotice && <p style={{ color: "#475569", marginBottom: 0, fontSize: "13px" }}>{restoredNotice}</p>}
               </div>
             )}
           </div>
@@ -541,7 +677,7 @@ export default function App() {
           <div className="section-heading-row">
             <div>
               <span className="kicker">
-                Model 2 analysis
+                Fraud analysis
               </span>
 
               <h1 id="review-date-heading">
@@ -550,7 +686,7 @@ export default function App() {
             </div>
 
             <span className="timezone">
-              Uploaded dataset · Experimental
+              Uploaded dataset
             </span>
           </div>
 
@@ -573,71 +709,42 @@ export default function App() {
           <article className="trend-card">
             <div className="card-heading">
               <div>
-                <span className="kicker">
-                  Illustrative activity trend
-                </span>
-
-                <h2>
-                  Suspicious Reservation Volume
-                </h2>
+                <span className="kicker">Uploaded reservation data</span>
+                <h2>Suspicious Reservation Volume</h2>
               </div>
 
-              <span className="experimental-badge">
-                Demo visualization
-              </span>
             </div>
-
-            <p
-              style={{
-                fontSize: "12px",
-                color: "#64748b",
-                marginBottom: "16px",
-              }}
-            >
-              Example chart only. Historical daily
-              counts are not provided by the prediction API.
+            <p style={{ fontSize: "12px", color: "#64748b", marginBottom: "16px" }}>
+              {predictionResults
+                ? "Flagged reservations by check-in date. Select a day to filter the queue; select it again to clear the filter."
+                : "Upload reservation and stay files to display actual flagged counts by check-in date."}
             </p>
-
             <div className="chart">
               <div className="y-axis">
-                <span>60</span>
-                <span>40</span>
-                <span>20</span>
+                <span>{chartMax}</span>
+                <span>{chartMax * 2 / 3}</span>
+                <span>{chartMax / 3}</span>
                 <span>0</span>
               </div>
-
               <div className="chart-body">
-                <div className="chart-grid">
-                  <i />
-                  <i />
-                  <i />
-                  <i />
-                </div>
-
+                <div className="chart-grid"><i /><i /><i /><i /></div>
                 <div className="bars">
-                  {trendData.map((value, index) => (
-                    <div
-                      className="bar-column"
-                      key={index}
-                    >
-                      <div
-                        className={`bar ${
-                          index === 28 ? "active" : ""
-                        }`}
-                        style={{
-                          height: `${(value / 60) * 100}%`,
-                        }}
-                      />
-                    </div>
-                  ))}
+                  {dailyTrend.length ? dailyTrend.map((day, index) => (
+                    <button type="button" className={`bar-column day-button ${selectedDay === day.date ? "day-selected" : ""}`} key={day.date}
+                      aria-label={`Filter cases for ${day.date}: ${day.flagged_count} flagged`}
+                      title={`${day.date}: ${day.flagged_count} flagged — click to filter queue`}
+                      onClick={() => {setSelectedDay(current => current === day.date ? null : day.date);}} >
+                      <div className={`bar ${index === dailyTrend.length - 1 ? "active" : ""}`}
+                        style={{ height: `${(day.flagged_count / chartMax) * 100}%` }} />
+                    </button>
+                  )) : <span style={{ alignSelf: "center", color: "#64748b", fontSize: "13px" }}>
+                    No analysis yet
+                  </span>}
                 </div>
-
                 <div className="x-axis">
-                  <span>Day 1</span>
-                  <span>Day 8</span>
-                  <span>Day 15</span>
-                  <span>Day 22</span>
-                  <strong>Day 30</strong>
+                  {dailyTrend.length ? [0, 7, 14, 21, 29].map((index) => (
+                    <span key={index}>{dailyTrend[index]?.date.slice(5)}</span>
+                  )) : <span>Waiting for uploaded data</span>}
                 </div>
               </div>
             </div>
@@ -654,7 +761,7 @@ export default function App() {
                 </span>
 
                 <h2>
-                  Model 2 Results
+                  Fraud Analysis Results
                 </h2>
               </div>
 
@@ -696,315 +803,11 @@ export default function App() {
                 tone="blue"
               />
             </div>
+            <div className="points-overview">
+              <div><span className="kicker">Potential loyalty points exposure</span><strong>{predictionResults ? pointsExposure.toLocaleString() : "—"}</strong><small>Points earned on flagged bookings; not verified losses or a cash valuation.</small></div>
+              <div><span className="kicker">Investigation progress</span><strong>{completedPct.toFixed(1)}%</strong><div className="progress-track"><div style={{width:`${completedPct}%`}} /></div><small>{completedCount.toLocaleString()} of {flaggedRows.length.toLocaleString()} cases completed</small></div>
+            </div>
           </section>
-        </section>
-
-        {/* MODEL COMPARISON */}
-
-        <section
-          className="model-workspace"
-          aria-labelledby="model-workspace-heading"
-        >
-          <div className="model-workspace-header">
-            <div>
-              <div className="model-title-line">
-                <span className="kicker">
-                  Model comparison &amp; details
-                </span>
-
-                <span className="experimental-badge">
-                  Experimental
-                </span>
-              </div>
-
-              <h2 id="model-workspace-heading">
-                Model Architecture &amp; Benchmark Comparison
-              </h2>
-            </div>
-
-            <div
-              className="model-tabs"
-              role="tablist"
-              aria-label="Model intelligence views"
-            >
-              <button
-                aria-selected={modelView === "details"}
-                className={
-                  modelView === "details" ? "active" : ""
-                }
-                onClick={() => setModelView("details")}
-                role="tab"
-                type="button"
-              >
-                Model Details · Top Signals
-              </button>
-
-              <button
-                aria-selected={modelView === "comparison"}
-                className={
-                  modelView === "comparison" ? "active" : ""
-                }
-                onClick={() => setModelView("comparison")}
-                role="tab"
-                type="button"
-              >
-                Benchmark Comparison
-              </button>
-            </div>
-          </div>
-
-          <div className="model-notice">
-            <Icon name="alert" size={15} />
-
-            <span>
-              <strong>
-                Experimental baseline on synthetic May 2026 data.
-              </strong>
-              {" "}Reported model performance has not been
-              validated on production Wyndham data.
-              Operational feature availability requires verification.
-            </span>
-          </div>
-
-          {modelView === "details" ? (
-            <div
-              className="signal-tape-panel"
-              role="tabpanel"
-            >
-              <div className="signal-tape-heading">
-                <span className="model-field-label">
-                  Observed signals · Synthetic May test data
-                </span>
-
-                <span>
-                  Historical analysis, not individual explanations
-                </span>
-              </div>
-
-              <div className="signal-tape">
-                {[
-                  [
-                    "1",
-                    "Qualification Code QXY",
-                    "100% Fraud Rate",
-                    "320/320 events in the analyzed synthetic subset",
-                  ],
-                  [
-                    "2",
-                    "Points Earned >20,000",
-                    "8.36% Fraud Rate",
-                    "Compared with the lower-point cohort",
-                  ],
-                  [
-                    "3",
-                    "Account Tenure 8–28 Days",
-                    "7.44% Fraud Rate",
-                    "Elevated concentration in synthetic data",
-                  ],
-                  [
-                    "4",
-                    "Rate Code SDC4",
-                    "0.33% Fraud Rate",
-                    "876 of 1,600 May fraud cases",
-                  ],
-                  [
-                    "5",
-                    "Same-Day Booking",
-                    "1.57% Fraud Rate",
-                    "Compared with longer lead times",
-                  ],
-                  [
-                    "6",
-                    "One-Night Stays",
-                    "90% of Fraud Events",
-                    "Concentration observed in test data",
-                  ],
-                  [
-                    "7",
-                    "Web & App Channels",
-                    "100% of Fraud",
-                    "Observed in synthetic May cases",
-                  ],
-                ].map(
-                  ([rank, label, metric, context]) => (
-                    <article
-                      className="signal-chip"
-                      key={rank}
-                    >
-                      <b>{rank}</b>
-                      <span>{label}</span>
-                      <strong>{metric}</strong>
-                      <small>{context}</small>
-                    </article>
-                  )
-                )}
-              </div>
-            </div>
-          ) : (
-            <div
-              className="model-comparison-grid"
-              role="tabpanel"
-            >
-              <article className="architecture-card">
-                <div className="architecture-heading">
-                  <span>Model A · Experimental</span>
-
-                  <h3>
-                    Model 1
-                    <small> (Booking-Time Risk)</small>
-                  </h3>
-                </div>
-
-                <dl>
-                  <div>
-                    <dt>Prediction stage</dt>
-                    <dd>
-                      At Booking Creation
-                      <span>Pre-Stay Risk Detection</span>
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Feature count</dt>
-                    <dd>
-                      <strong>13 Features</strong>
-                      <span>
-                        Booking behavior, account tenure,
-                        and historical reservation activity
-                      </span>
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Performance</dt>
-                    <dd>
-                      <strong>
-                        49.0% Precision · 100.0% Recall
-                      </strong>
-                      <span>
-                        326 false positives in held-out synthetic data
-                      </span>
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Operational role</dt>
-                    <dd>
-                      Early warning for suspicious bookings
-                    </dd>
-                  </div>
-                </dl>
-              </article>
-
-              <article className="architecture-card">
-                <div className="architecture-heading">
-                  <span>Model B · Experimental</span>
-
-                  <h3>
-                    Conservative Model 1
-                    <small> (Booking-Time Only)</small>
-                  </h3>
-                </div>
-
-                <dl>
-                  <div>
-                    <dt>Prediction stage</dt>
-                    <dd>
-                      At Booking Creation
-                      <span>No Post-Stay Features</span>
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Feature count</dt>
-                    <dd>
-                      <strong>9 Features</strong>
-                      <span>
-                        Booking dynamics and account age
-                      </span>
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Performance</dt>
-                    <dd>
-                      <strong>
-                        46.7% Precision · 100.0% Recall
-                      </strong>
-                      <span>
-                        357 false positives in synthetic evaluation
-                      </span>
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Operational role</dt>
-                    <dd>
-                      Conservative booking-time risk screening
-                    </dd>
-                  </div>
-                </dl>
-              </article>
-
-              <article className="architecture-card recommended">
-                <div className="recommendation-label">
-                  Recommended benchmark
-                </div>
-
-                <div className="architecture-heading">
-                  <span>Model C · Experimental</span>
-
-                  <h3>
-                    Model 2
-                    <small> (Pre-Redemption Intervention)</small>
-                  </h3>
-                </div>
-
-                <dl>
-                  <div>
-                    <dt>Prediction stage</dt>
-                    <dd>
-                      Post-Stay / Outcome Posted
-                      <span>
-                        Before potential loyalty-point redemption
-                      </span>
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Feature count</dt>
-                    <dd>
-                      <strong>18 Features</strong>
-                      <span>
-                        Includes current qualification outcomes,
-                        points earned, and room revenue
-                      </span>
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Performance</dt>
-                    <dd>
-                      <strong>
-                        97.5% Precision · 100.0% Recall
-                      </strong>
-                      <span>
-                        8 false positives in held-out synthetic data
-                      </span>
-                    </dd>
-                  </div>
-
-                  <div>
-                    <dt>Operational role</dt>
-                    <dd>
-                      Identify potentially suspicious loyalty activity
-                      for analyst review
-                    </dd>
-                  </div>
-                </dl>
-              </article>
-            </div>
-          )}
         </section>
 
         {/* INVESTIGATION FILTERS */}
@@ -1013,6 +816,12 @@ export default function App() {
           className="toolbar"
           aria-label="Queue search and filters"
         >
+          <div className="queue-tabs" role="group" aria-label="Case status filters">
+            <button type="button" className={queueTab === "active" ? "active" : ""} onClick={() => {setQueueTab("active");setSelectedConfirmation(null);}}>Active ({activeCount})</button>
+            <button type="button" className={queueTab === "reviewing" ? "active" : ""} onClick={() => {setQueueTab("reviewing");setSelectedConfirmation(null);}}>Under Review ({reviewingCount})</button>
+            <button type="button" className={queueTab === "reviewed" ? "active" : ""} onClick={() => {setQueueTab("reviewed");setSelectedConfirmation(null);}}>Reviewed ({reviewedCount})</button>
+          </div>
+          {selectedDay && <button className="day-clear" type="button" onClick={()=>setSelectedDay(null)}>Date: {selectedDay} ×</button>}
           <label className="queue-search">
             <Icon name="search" size={17} />
 
@@ -1070,7 +879,7 @@ export default function App() {
                 </span>
 
                 <h2 id="queue-heading">
-                  Detailed Investigation Queue
+                  {queueTab === "reviewed" ? "Reviewed Cases" : queueTab === "reviewing" ? "Cases Under Review" : "Detailed Investigation Queue"}
                 </h2>
               </div>
 
@@ -1084,10 +893,10 @@ export default function App() {
               <table>
                 <thead>
                   <tr>
-                    <th>Risk Score</th>
+                    <th>Risk / Decision</th>
                     <th>Confirmation #</th>
                     <th>Member ID</th>
-                    <th>Model Prediction</th>
+                    <th>Review Status</th>
                     <th>Action</th>
                   </tr>
                 </thead>
@@ -1102,27 +911,19 @@ export default function App() {
                           ? "selected-row"
                           : ""
                       }
-                      onClick={() =>
-                        setSelectedConfirmation(
-                          row.confirmation_number
-                        )
-                      }
+                      onClick={() => { openCase(row.confirmation_number); }}
                     >
                       <td>
-                        <RiskBadge
-                          score={row.fraud_risk_score}
-                        />
+                        {statusOf(cases, row.confirmation_number) === "flagged"
+                          ? <RiskBadge score={row.fraud_risk_score} />
+                          : <span className={`decision-pill ${statusOf(cases, row.confirmation_number)}`}>{statusOf(cases, row.confirmation_number) === "cleared" ? "✓ " : ""}{statusLabel[statusOf(cases, row.confirmation_number)].split(" · ")[0]}</span>}
                       </td>
 
                       <td>
                         <button
                           className="mono-link"
                           type="button"
-                          onClick={() =>
-                            setSelectedConfirmation(
-                              row.confirmation_number
-                            )
-                          }
+                          onClick={() => { openCase(row.confirmation_number); }}
                         >
                           {row.confirmation_number}
                         </button>
@@ -1135,13 +936,11 @@ export default function App() {
                       </td>
 
                       <td>
-                        <strong className="explanation">
-                          Flagged for review
+                        <strong className={`explanation status-${statusOf(cases, row.confirmation_number)}`}>
+                          {statusLabel[statusOf(cases, row.confirmation_number)]}
                         </strong>
 
-                        <span className="cell-detail">
-                          Model 2 prediction
-                        </span>
+                        <span className="cell-detail">Original model risk: {(row.fraud_risk_score * 100).toFixed(0)}%{(cases[row.confirmation_number]?.notes.length ?? 0) > 0 ? ` · ${cases[row.confirmation_number].notes.length} note${cases[row.confirmation_number].notes.length === 1 ? "" : "s"}` : ""}</span>
                       </td>
 
                       <td>
@@ -1150,13 +949,10 @@ export default function App() {
                           type="button"
                           onClick={(event) => {
                             event.stopPropagation();
-                            setSelectedConfirmation(
-                              row.confirmation_number
-                            );
+                            openCase(row.confirmation_number);
                           }}
                         >
-                          Review
-                          <Icon name="chevron" size={12} />
+                          View case
                         </button>
                       </td>
                     </tr>
@@ -1183,7 +979,7 @@ export default function App() {
                 flaggedRows.length > 0 &&
                 visibleRows.length === 0 && (
                   <div className="empty-state">
-                    No reservations match your search.
+                    No cases match this view or search.
                   </div>
                 )}
             </div>
@@ -1191,7 +987,7 @@ export default function App() {
             <div className="table-footer">
               <span>
                 Showing {visibleRows.length} of{" "}
-                {flaggedRows.length} flagged reservations
+                {flaggedRows.length} total flagged reservations
               </span>
 
               <span>
@@ -1201,232 +997,84 @@ export default function App() {
               </span>
             </div>
 
-            <p className="compliance-note">
-              <strong>Experimental Review:</strong>
-              {" "}Predictions are generated by Model 2.
-              Analyst notes and decisions in this prototype
-              are local demonstration state only.
-              No operational action is performed.
-            </p>
+            <p className="compliance-note">Experimental screening on uploaded data. Analyst decisions are saved locally; no operational action is performed.</p>
           </section>
 
-          {/* INVESTIGATION DETAILS */}
-
-          <aside
-            className="investigation-panel"
-            aria-labelledby="investigation-heading"
-          >
-            <div className="panel-top">
-              <span className="kicker">
-                Investigation
-              </span>
-
-              <h2 id="investigation-heading">
-                {selected
-                  ? `Reservation ${selected.confirmation_number}`
-                  : "Reservation Details"}
-              </h2>
-
-              <p className="member-overview">
-                {selected
-                  ? `Member ${selected.member_number ?? "Not available"}`
-                  : "Select a flagged reservation to review."}
-              </p>
+          {/* Focused analyst workspace: full-size case view, not a narrow sidebar. */}
+          {selectedConfirmation && selected && (
+            <div className="case-modal-backdrop" onMouseDown={(event) => {if(event.target === event.currentTarget) void closeCase();}}>
+              <section className="case-modal" role="dialog" aria-modal="true" aria-labelledby="case-title">
+                <header className="case-modal-header">
+                  <div>
+                    <span className="kicker">Reservation investigation</span>
+                    <h2 id="case-title">{selected.confirmation_number}</h2>
+                    <p>Member {displayValue(selected.member_number)} · {statusLabel[currentStatus]}</p>
+                  </div>
+                  <button type="button" className="case-close" onClick={() => void closeCase()} disabled={caseBusy} aria-label="Save and close case details">✕</button>
+                </header>
+                <div className="case-modal-body">
+                  <div className="case-review-main">
+                    <div className="case-section">
+                      <h3>Reservation & stay details</h3>
+                      <p className="case-help">Information from the uploaded reservation and stay files. Missing values are shown as unavailable.</p>
+                      <div className="case-facts-grid">
+                        <div><span>Booking date</span><strong>{formatDate(selected.booking_timestamp)}</strong></div>
+                        <div><span>Check-in</span><strong>{formatDate(selected.check_in_date)}</strong></div>
+                        <div><span>Check-out</span><strong>{formatDate(selected.check_out_date)}</strong></div>
+                        <div><span>Booking channel</span><strong>{displayValue(selected.booking_channel)}</strong></div>
+                        <div><span>Rate code</span><strong>{displayValue(selected.rate_code)}</strong></div>
+                        <div><span>Stay qualification</span><strong>{displayValue(selected.qualification_code)}</strong></div>
+                        <div><span>Points earned</span><strong>{formatNumber(selected.points_earned)}</strong></div>
+                        <div><span>Points redeemed</span><strong>{formatNumber(selected.points_redeemed)}</strong></div>
+                        <div><span>Room revenue</span><strong>{formatNumber(selected.room_revenue)}</strong></div>
+                      </div>
+                    </div>
+                    <div className="case-section">
+                      <h3>Evidence for analyst review</h3>
+                      <p className="case-help">These are review prompts based on available fields, not verified reasons for the prediction.</p>
+                      <div className="case-checks">
+                        <div><strong>Booking lead time</strong><span>{selected.booking_timestamp && selected.check_in_date ? `${Math.round((new Date(selected.check_in_date).getTime() - new Date(selected.booking_timestamp).getTime()) / 86400000)} days before check-in` : "Not available"}</span></div>
+                        <div><strong>Length of stay</strong><span>{selected.check_in_date && selected.check_out_date ? `${Math.round((new Date(selected.check_out_date).getTime() - new Date(selected.check_in_date).getTime()) / 86400000)} night(s)` : "Not available"}</span></div>
+                        <div><strong>Loyalty activity</strong><span>{formatNumber(selected.points_earned)} points earned · {formatNumber(selected.points_redeemed)} redeemed</span></div>
+                        <div><strong>Qualification & rate</strong><span>{displayValue(selected.qualification_code)} · {displayValue(selected.rate_code)}</span></div>
+                        <div><strong>Account tenure at booking</strong><span>{selected.member_enrollment_date && selected.booking_timestamp ? `${Math.round((new Date(selected.booking_timestamp).getTime() - new Date(selected.member_enrollment_date).getTime()) / 86400000)} days` : "Not available"}</span></div>
+                        <div><strong>Potential points exposure</strong><span>{formatNumber(selected.points_earned)} earned points associated with this flagged booking (not confirmed loss)</span></div>
+                      </div>
+                      <p className="case-help">Confirm suspicious activity against policy and source records before concluding fraud. This prototype does not provide member history, verified fraud labels, or individual feature attributions.</p>
+                    </div>
+                  </div>
+                  <aside className="case-review-actions">
+                    <div className="case-section">
+                      <span className="panel-label">Fraud analysis</span>
+                      <div className="case-score"><span className={`decision-pill ${currentStatus}`}>{statusLabel[currentStatus]}</span><span className="model-risk">Model risk: {(selected.fraud_risk_score * 100).toFixed(0)}%</span></div>
+                      <strong>{currentStatus === "cleared" ? "Cleared — no further action" : currentStatus === "confirmed_fraud" ? "Fraud confirmed by analyst" : currentStatus === "escalated" ? "Escalated for further investigation" : currentStatus === "reviewing" ? "Investigation in progress" : "Flagged for analyst review"}</strong>
+                      <p className="case-help">Risk score is a screening output, not a confirmed fraud finding. It does not change when an analyst updates the case.</p>
+                    </div>
+                    <div className="case-section">
+                      <label className="case-status-label" htmlFor="case-status">Review decision</label>
+                      <select id="case-status" className="case-status-select" value={currentStatus} disabled={caseBusy} onChange={e => void updateCase(selected.confirmation_number, e.target.value as CaseStatus, comment)}>
+                        <option value="flagged">Not started</option>
+                        <option value="reviewing">Under review</option>
+                        <option value="cleared">Cleared / no further action</option>
+                        <option value="escalated">Escalated / further investigation</option>
+                        <option value="confirmed_fraud">Confirmed fraud (documented evidence)</option>
+                      </select>
+                      <p className="case-help">Select Under review before a final decision. For Clear, Escalate, or Confirm fraud, enter a rationale below. Confirmed fraud is a recorded analyst decision only, not a Wyndham system update.</p>
+                      {caseError && <p className="case-error" role="alert">{caseError}</p>}
+                      {caseNotice && <p className="case-saved" role="status">✓ {caseNotice} · Decision and notes retained after closing</p>}
+                    </div>
+                    <div className="case-section">
+                      <h3>Analyst notes</h3>
+                      <div className="case-notes">{currentComments.length ? currentComments.map((entry,i) => <div key={i} className="case-note"><small>{new Date(entry.created_at).toLocaleString()}</small><p>{entry.text}</p></div>) : <p className="case-help">No notes yet.</p>}</div>
+                      <textarea aria-label="Analyst note" value={comment} onChange={e=>{setComment(e.target.value);setCaseNotice("");}} rows={4} placeholder="Record evidence, follow-up, or decision rationale..." />
+                      <button type="button" className="primary-action case-save" disabled={caseBusy || !comment.trim()} onClick={()=>void updateCase(selected.confirmation_number,undefined,comment)}>Save note</button>
+                    </div>
+                  </aside>
+                </div>
+                <footer className="case-modal-footer">Local demonstration only · No accounts, loyalty points, or bookings are changed. <button type="button" disabled={caseBusy} onClick={()=>void closeCase()}>{caseBusy ? "Saving…" : comment.trim() ? "Save note & close" : "Close"}</button></footer>
+              </section>
             </div>
-
-            {selected ? (
-              <>
-                <div className="timeline-section">
-                  <div className="panel-label">
-                    Model 2 Assessment
-                  </div>
-
-                  <div
-                    style={{
-                      padding: "16px 0",
-                    }}
-                  >
-                    <p>
-                      <strong>
-                        Fraud Risk Score
-                      </strong>
-                    </p>
-
-                    <div style={{ marginBottom: "16px" }}>
-                      <RiskBadge
-                        score={selected.fraud_risk_score}
-                      />
-                    </div>
-
-                    <p>
-                      <strong>
-                        Prediction:
-                      </strong>
-                      {" "}Flagged for analyst review
-                    </p>
-
-                    <p
-                      style={{
-                        fontSize: "13px",
-                        color: "#64748b",
-                        lineHeight: 1.6,
-                      }}
-                    >
-                      This score comes from the saved
-                      Model 2 pipeline. A positive
-                      prediction is a screening result,
-                      not proof of fraud.
-                    </p>
-                  </div>
-                </div>
-
-                <div className="signal-section">
-                  <div className="panel-label">
-                    Model Explanation
-                  </div>
-
-                  <p
-                    style={{
-                      fontSize: "13px",
-                      color: "#64748b",
-                      lineHeight: 1.6,
-                    }}
-                  >
-                    Individual feature contributions
-                    and SHAP explanations are not
-                    currently returned by the backend.
-                    This section can be connected
-                    when explanation data is available.
-                  </p>
-                </div>
-
-                <div className="decision-section">
-                  <div className="panel-label">
-                    Analyst Review · Prototype
-                  </div>
-
-                  {currentDecision && (
-                    <div
-                      className="decision-confirmation"
-                      role="status"
-                    >
-                      <Icon name="check" size={14} />
-                      {" "}Local review status: {currentDecision}
-                    </div>
-                  )}
-
-                  <div className="decision-actions">
-                    <button
-                      className="primary-action"
-                      type="button"
-                      onClick={() =>
-                        saveDecision("Escalated for review")
-                      }
-                    >
-                      <Icon name="shield" size={15} />
-                      Escalate for Review
-                    </button>
-
-                    <button
-                      className="secondary-action"
-                      type="button"
-                      onClick={() =>
-                        saveDecision("Marked false positive")
-                      }
-                    >
-                      Mark False Positive
-                    </button>
-                  </div>
-
-                  <p
-                    style={{
-                      fontSize: "12px",
-                      color: "#64748b",
-                      lineHeight: 1.6,
-                    }}
-                  >
-                    Demo actions only. No points
-                    are frozen, accounts suspended,
-                    or backend records updated.
-                  </p>
-
-                  <div className="audit-record">
-                    <div className="audit-heading">
-                      <span className="panel-label">
-                        Review Comments
-                      </span>
-
-                      <span>
-                        {currentComments.length} local notes
-                      </span>
-                    </div>
-
-                    {currentComments.map(
-                      (entry, index) => (
-                        <div
-                          className="audit-entry"
-                          key={index}
-                        >
-                          <div>
-                            <strong>
-                              Prototype Analyst
-                            </strong>
-                            <time>Current session</time>
-                          </div>
-
-                          <p>{entry}</p>
-                        </div>
-                      )
-                    )}
-
-                    <label className="comment-box">
-                      <span>
-                        Add analyst comment
-                      </span>
-
-                      <textarea
-                        aria-label="Add analyst comment"
-                        value={comment}
-                        onChange={(event) =>
-                          setComment(event.target.value)
-                        }
-                        placeholder="Add context for this review..."
-                        rows={3}
-                      />
-                    </label>
-
-                    <button
-                      className="save-comment"
-                      type="button"
-                      disabled={!comment.trim()}
-                      onClick={saveComment}
-                    >
-                      Save Comment
-                    </button>
-
-                    <p className="feedback-disclosure">
-                      Comments and decisions are
-                      stored only in the current
-                      browser session's React state.
-                      They are not a persistent audit
-                      trail and do not retrain the model.
-                    </p>
-                  </div>
-                </div>
-              </>
-            ) : (
-              <div
-                className="empty-state"
-                style={{
-                  padding: "32px 20px",
-                }}
-              >
-                {predictionResults
-                  ? "No flagged reservation is available for investigation."
-                  : "Run Model 2 to populate this investigation panel."}
-              </div>
-            )}
-          </aside>
+          )}
         </div>
       </main>
     </div>
